@@ -1,226 +1,320 @@
 'use strict';
 
-const Auth = require('./auth').Auth;
-const make_client = require('./client').make_client;
-const ReqlConnection = require('./reql_connection').ReqlConnection;
-const logger = require('./logger');
-const options_schema = require('./schema/server_options').server;
-const getType = require('mime-types').contentType;
+const Auth = require('./auth');
+const ClientConnection = require('./client_connection');
+const {ReliableConn} = require('./reliable');
+const schema = require('./schema');
+const Request = require('./request');
 
-// TODO: dynamically serve different versions of the horizon
-// library. Minified, Rx included etc.
-const horizon_client_path = require.resolve('@horizon/client/dist/horizon');
-
-const endpoints = {
-  insert: require('./endpoint/insert'),
-  query: require('./endpoint/query'),
-  remove: require('./endpoint/remove'),
-  replace: require('./endpoint/replace'),
-  store: require('./endpoint/store'),
-  subscribe: require('./endpoint/subscribe'),
-  update: require('./endpoint/update'),
-  upsert: require('./endpoint/upsert'),
-};
-
-const assert = require('assert');
 const fs = require('fs');
+const EventEmitter = require('events');
+
+const r = require('rethinkdb');
 const Joi = require('joi');
-const path = require('path');
-const url = require('url');
 const websocket = require('ws');
+const Toposort = require('toposort-class');
 
-const protocol_name = 'rethinkdb-horizon-v0';
+const protocolName = 'rethinkdb-horizon-v1';
+const clientSourcePath = require.resolve('@horizon/client/dist/horizon');
+const clientSourceCorePath = require.resolve('@horizon/client/dist/horizon-core');
 
-const accept_protocol = (protocols, cb) => {
-  if (protocols.findIndex((x) => x === protocol_name) !== -1) {
-    cb(true, protocol_name);
-  } else {
-    logger.debug(`Rejecting client without "${protocol_name}" protocol (${protocols}).`);
-    cb(false, null);
-  }
-};
+// Load these lazily (but synchronously)
 
-const serve_file = (file_path, res) => {
-  fs.access(file_path, fs.R_OK | fs.F_OK, (exists) => {
-    if (exists) {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end(`Client library not found\n`);
-    } else {
-      fs.readFile(file_path, 'binary', (err, file) => {
-        if (err) {
-          res.writeHead(500, { 'Content-Type': 'text/plain' });
-          res.end(`${err}\n`);
-        } else {
-          const type = getType(path.extname(file_path)) || false;
-          if (type) {
-            res.writeHead(200, { 'Content-Type': type });
-          } else {
-            res.writeHead(200);
-          }
-          res.end(file, 'binary');
-        }
-      });
+function lazyLoadSource(sourcePath) {
+  let buffer;
+  return () => {
+    if (!buffer) {
+      buffer = fs.readFileSync(sourcePath);
     }
+    return buffer;
+  };
+}
+
+const clientSource = lazyLoadSource(clientSourcePath);
+const clientSourceMap = lazyLoadSource(`${clientSourcePath}.map`);
+const clientSourceCore = lazyLoadSource(clientSourceCorePath);
+const clientSourceCoreMap = lazyLoadSource(`${clientSourceCorePath}.map`);
+
+function makeCapabilitiesCode(capabilities) {
+  return `
+;{
+  let capabilities = ${JSON.stringify(capabilities)};
+  Object.keys(capabilities).forEach(function (key) {
+    Horizon.addOption(key, capabilities[key].type);
   });
-};
+};`;
+}
 
 class Server {
-  constructor(http_servers, user_opts) {
-    const opts = Joi.attempt(user_opts || { }, options_schema);
-    this._path = opts.path;
-    this._name = opts.project_name;
-    this._max_connections = opts.max_connections;
-    this._permissions_enabled = opts.permissions;
-    this._auth_methods = { };
-    this._request_handlers = new Map();
-    this._http_handlers = new Map();
-    this._ws_servers = [ ];
-    this._close_promise = null;
-    this._interruptor = new Promise((resolve, reject) => {
-      this._interrupt = reject;
+    constructor(httpServers, options) {
+    this.events = new EventEmitter();
+    this.httpServers = httpServers[Symbol.iterator] ? Array.from(httpServers) : [httpServers];
+
+    this._wsServers = [];
+    this._closePromise = null;
+    this._methods = {};
+    this._middlewareMethods = new Set();
+    this._clients = new Set();
+
+    this.context = {
+      horizon: {
+        events: this.events,
+        options: Joi.attempt(options || {}, schema.server),
+        protocol: protocolName,
+        r,
+      },
+    };
+
+    this.context.horizon.reliableConn = new ReliableConn(this.context, {
+      host: this.context.horizon.options.rdbHost,
+      port: this.context.horizon.options.rdbPort,
+      db: this.context.horizon.options.projectName,
+      user: this.context.horizon.options.rdbUser || 'admin',
+      password: this.context.horizon.options.rdbPassword || '',
+      timeout: this.context.horizon.options.rdbTimeout || null,
     });
 
-    try {
-      this._reql_conn = new ReqlConnection(opts.rdb_host,
-                                           opts.rdb_port,
-                                           opts.project_name,
-                                           opts.auto_create_collection,
-                                           opts.auto_create_index,
-                                           opts.rdb_user || null,
-                                           opts.rdb_password || null,
-                                           opts.rdb_timeout || null,
-                                           this._interruptor);
-      this._auth = new Auth(this, opts.auth);
-      for (const key in endpoints) {
-        this.add_request_handler(key, endpoints[key].run);
+
+    this.context.horizon.conn = () => this.context.horizon.reliableConn.connection();
+    this.context.horizon.auth = new Auth(this.context);
+
+    // Replace the auth options with the verified options
+    this.context.horizon.options.auth = this.context.horizon.auth.options;
+
+    // Hide the rdbPassword and tokenSecret from plugins
+    this.context.horizon.options.rdbPassword = null;
+    this.context.horizon.options.auth.tokenSecret = null;
+
+    // Freeze the 'official' horizon context so plugins can't fuck with it
+    // TODO: might be some valid use cases for fucking with it, consider not doing this
+    Object.freeze(this.context.horizon.options.auth);
+    Object.freeze(this.context.horizon.options);
+    Object.freeze(this.context.horizon);
+
+    this._connSubscription = this.context.horizon.reliableConn.subscribe({
+      onReady: () => {
+        this.context.horizon.events.emit('ready', this);
+      },
+      onUnready: (err) => {
+        // Disconnect any clients we have
+        this.context.horizon.events.emit('unready', this, err);
+        const msg = (err && err.message) || 'Connection to database is down.';
+        this._clients.forEach((client) => client.close({error: msg}));
+        this._clients.clear();
+      },
+      onError: (err) => {
+        this.events.emit('log', 'error',
+          `Connection to database down: ${err.message}.`);
+      },
+    });
+
+    this._requestHandler = (req, res, next) => {
+      let terminal = null;
+      const requirements = {};
+
+      this._middlewareMethods.forEach((name) => {
+        requirements[name] = true;
+      });
+
+      for (const o in req.options) {
+        const m = this._methods[o];
+        if (!m) {
+          next(new Error(`No method to handle option "${o}".`));
+          return;
+        }
+
+        if (m.type === 'terminal') {
+          if (terminal !== null) {
+            next(new Error('Multiple terminal methods in request: ' +
+                           `"${terminal}", "${o}".`));
+            return;
+          }
+          terminal = o;
+        } else {
+          requirements[o] = true;
+        }
+        for (const requirement of m.requires) {
+          requirements[requirement] = true;
+        }
       }
 
-      const verify_client = (info, cb) => {
+      if (terminal === null) {
+        next(new Error('No terminal method was specified in the request.'));
+      } else if (requirements[terminal]) {
+        next(new Error(`Terminal method "${terminal}" is also a requirement.`));
+      } else {
+        const ordering = this._getRequirementsOrdering();
+        const chain = Object.keys(requirements).sort(
+          (a, b) => ordering[a] - ordering[b]);
+        chain.push(terminal);
+
+        chain.reduceRight((cb, methodName) =>
+          (maybeErr) => {
+            if (maybeErr instanceof Error) {
+              next(maybeErr);
+            } else {
+              try {
+                this._methods[methodName].handler(new Request(req, methodName), res, cb);
+              } catch (e) {
+                next(e);
+              }
+            }
+          }, next)();
+      }
+    };
+
+    const wsOptions = {
+      handleProtocols: (protocols, cb) => {
+        const res = protocols.includes(protocolName);
+        cb(res, res ? protocolName : null);
+        if (!res) {
+          this.context.horizon.events.emit('log', 'debug',
+            `Rejecting client without "${protocolName}" protocol ` +
+            `(${JSON.stringify(protocols)})`);
+        }
+      },
+      verifyClient: (info, cb) => {
         // Reject connections if we aren't synced with the database
-        if (!this._reql_conn.is_ready()) {
+        if (!this.context.horizon.reliableConn.ready) {
           cb(false, 503, 'Connection to the database is down.');
         } else {
           cb(true);
         }
-      };
+      },
+      path: this.context.horizon.options.path,
+    };
 
-      const ws_options = { handleProtocols: accept_protocol,
-                           allowRequest: verify_client,
-                           path: this._path };
+    // RSI: only become ready when the websocket servers and the
+    // connection are both ready.
+    this.httpServers.forEach((server) => {
+      const wsServer = new websocket.Server(Object.assign({server}, wsOptions))
+        .on('error', (error) =>
+          this.context.horizon.events.emit('log', 'error',
+            `Websocket server error: ${error}`))
+        .on('connection', (socket) => {
+          try {
+            if (!this.context.horizon.reliableConn.ready) {
+              throw new Error('No connection to the database.');
+            }
 
-      const add_websocket = (server) => {
-        const ws_server = new websocket.Server(Object.assign({ server }, ws_options))
-        .on('error', (error) => logger.error(`Websocket server error: ${error}`))
-        .on('connection', (socket) => make_client(socket, this));
-
-        this._ws_servers.push(ws_server);
-      };
-
-      const path_replace = new RegExp('^' + this._path + '/');
-      const add_http_listener = (server) => {
-        // TODO: this doesn't play well with a user removing listeners (or maybe even `once`)
-        const extant_listeners = server.listeners('request').slice(0);
-        server.removeAllListeners('request');
-        server.on('request', (req, res) => {
-          const req_path = url.parse(req.url).pathname;
-          if (req_path.indexOf(`${this._path}/`) === 0) {
-            const sub_path = req_path.replace(path_replace, '');
-            const handler = this._http_handlers.get(sub_path);
-            if (handler !== undefined) {
-              logger.debug(`Handling HTTP request to horizon subpath: ${sub_path}`);
-              return handler(req, res);
+            const client = new ClientConnection(this.context, socket, this._requestHandler);
+            this._clients.add(client);
+            this.context.horizon.events.emit('connect', client.clientContext);
+            socket.once('close', () => {
+              this._clients.delete(client);
+              this.context.horizon.events.emit('disconnect', client.clientContext);
+            });
+          } catch (err) {
+            this.context.horizon.events.emit('log', 'error',
+              `Failed to construct client: ${err}`);
+            if (socket.readyState === websocket.OPEN) {
+              socket.close(1002, err.message.substr(0, 64));
             }
           }
-          if (extant_listeners.length === 0) {
-            res.statusCode = 404;
-            res.write('File not found.');
-            res.end();
-          } else {
-            extant_listeners.forEach((l) => l.call(server, req, res));
+        });
+
+      this._wsServers.push(wsServer);
+    });
+  }
+
+  _invalidateCapabilities() {
+    this._capabilities = null;
+    this._requirementsOrder = null;
+    this._applyCapabilitiesCode = null;
+    this._modifiedClientSource = null;
+    this._modifiedClientSourceCore = null;
+  }
+
+  addMethod(name, rawOptions) {
+    const options = Joi.attempt(rawOptions, schema.method);
+    if (this._methods[name]) {
+      throw new Error(`"${name}" is already registered as a method.`);
+    }
+    this._invalidateCapabilities();
+    this._methods[name] = options;
+    if (options.type === 'middleware') {
+      this._middlewareMethods.add(name);
+    }
+  }
+
+  removeMethod(name) {
+    const options = this._methods[name];
+    if (options) {
+      this._invalidateCapabilities();
+      this._middlewareMethods.delete(name);
+      delete this._methods[name];
+    }
+  }
+
+  _getRequirementsOrdering() {
+    if (!this._requirementsOrdering) {
+      const topo = new Toposort();
+      for (const m in this._methods) {
+        const reqs = this._methods[m].requires;
+        topo.add(m, reqs);
+        for (const req of reqs) {
+          if (!this._methods[req]) {
+            throw new Error(
+              `Missing method "${req}", which is required by method "${m}".`);
           }
-        });
-      };
-
-      this.add_http_handler('horizon.js', (req, res) => {
-        serve_file(horizon_client_path, res);
-      });
-
-      this.add_http_handler('horizon.js.map', (req, res) => {
-        serve_file(`${horizon_client_path}.map`, res);
-      });
-
-      this.add_http_handler('auth_methods', (req, res) => {
-        res.writeHead(200, {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': opts.access_control_allow_origin,
-        });
-        res.end(JSON.stringify(this._auth_methods));
-      });
-
-      if (http_servers.forEach === undefined) {
-        add_websocket(http_servers);
-        add_http_listener(http_servers);
-      } else {
-        http_servers.forEach((s) => { add_websocket(s); add_http_listener(s); });
+        }
       }
-    } catch (err) {
-      this._interrupt(err);
-      throw err;
+      this._requirementsOrdering = topo.sort().reverse();
     }
+    return this._requirementsOrdering;
   }
 
-  add_request_handler(request_name, endpoint) {
-    assert(endpoint !== undefined);
-    assert(this._request_handlers.get(request_name) === undefined);
-    this._request_handlers.set(request_name, endpoint);
-  }
-
-  get_request_handler(request) {
-    return this._request_handlers.get(request.type);
-  }
-
-  remove_request_handler(request_name) {
-    return this._request_handlers.delete(request_name);
-  }
-
-  add_http_handler(sub_path, handler) {
-    logger.debug(`Added HTTP handler at ${this._path}/${sub_path}`);
-    assert.notStrictEqual(handler, undefined);
-    assert.strictEqual(this._http_handlers.get(sub_path), undefined);
-    this._http_handlers.set(sub_path, handler);
-  }
-
-  remove_http_handler(sub_path) {
-    return this._http_handlers.delete(sub_path);
-  }
-
-  add_auth_provider(provider, options) {
-    assert(provider.name);
-    assert(options.path);
-    assert.strictEqual(this._auth_methods[provider.name], undefined);
-    this._auth_methods[provider.name] = `${this._path}/${options.path}`;
-    provider(this, options);
-  }
-
-  ready() {
-    return this._reql_conn.ready().then(() => this);
-  }
-
+  // TODO: We close clients in `onUnready` above, but don't wait for them to be closed.
   close() {
-    if (!this._close_promise) {
-      this._interrupt(new Error('Horizon server is shutting down.'));
-      this._close_promise = Promise.all([
-        Promise.all(this._ws_servers.map((s) => new Promise((resolve) => {
+    if (!this._closePromise) {
+      this._closePromise =
+        Promise.all(this._wsServers.map((s) => new Promise((resolve) => {
           s.close(resolve);
-        }))),
-        this._reql_conn.ready().catch(() => { }),
-      ]);
+        }))).then(() => this.context.horizon.reliableConn.close());
     }
-    return this._close_promise;
+    return this._closePromise;
+  }
+
+  capabilities() {
+    if (!this._capabilities) {
+      this._capabilities = {};
+      for (const key in this._methods) {
+        this._capabilities[key] = {type: this._methods[key].type};
+      }
+    }
+    return this._capabilities;
+  }
+
+  applyCapabilitiesCode() {
+    if (!this._applyCapabilitiesCode) {
+      this._applyCapabilitiesCode = makeCapabilitiesCode(this.capabilities());
+    }
+    return this._applyCapabilitiesCode;
+  }
+
+  clientSource() {
+    if (!this._modifiedClientSource) {
+      this._modifiedClientSource = clientSource() + this.applyCapabilitiesCode();
+    }
+    return this._modifiedClientSource;
+  }
+
+  clientSourceMap() {
+    return clientSourceMap();
+  }
+
+  clientSourceCore() {
+    if (!this._modifiedClientSourceCore) {
+      this._modifiedClientSourceCore = clientSourceCore() + this.applyCapabilitiesCode();
+    }
+    return this._modifiedClientSourceCore;
+  }
+
+  clientSourceCoreMap() {
+    return clientSourceCoreMap();
   }
 }
 
 module.exports = {
   Server,
-  protocol: protocol_name,
 };

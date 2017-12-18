@@ -1,0 +1,40 @@
+{
+  "name": "@horizon/server-test",
+  "version": "1.0.0",
+  "description": "Embedded horizon server for running tests.",
+  "main": "src/main.js",
+  "scripts": {
+    "lint": "eslint src",
+    "test": "mocha --preserve-symlinks --timeout 10000 src/test",
+    "serve": "node ./src/serve.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rethinkdb/horizon.git"
+  },
+  "author": "RethinkDB",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/rethinkdb/horizon/issues"
+  },
+  "homepage": "https://github.com/rethinkdb/horizon#readme",
+  "engines": {
+    "node": ">=4.0.0"
+  },
+  "dependencies": {
+    "@horizon-plugins/defaults": "1.x",
+    "@horizon/base-router": "1.x",
+    "@horizon/plugin-utils": "1.x",
+    "argparse": "^1.0.7",
+    "horizon": "3.x",
+    "jsonpatch": "^3.0.1",
+    "winston": "^2.2.0"
+  },
+  "devDependencies": {
+    "eslint": "^3.1.0",
+    "istanbul": "^0.4.3",
+    "mocha": "^2.5.3",
+    "rethinkdb": "^2.1.1",
+    "ws": "^1.1.0"
+  }
+}

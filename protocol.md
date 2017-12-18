@@ -6,13 +6,13 @@ For now let's just leave this a placeholder, since we haven't gotten to authenti
 #### Handshake Request
 ```
 {
-  "request_id": <NUMBER>,
+  "requestId": <NUMBER>,
   "method": "unauthenticated" | "anonymous" | "token",
   "token": <STRING>,
 }
 ```
 
-* `request_id` is a number uniquely identifying this request, it will be returned in the response.
+* `requestId` is a number uniquely identifying this request, it will be returned in the response.
 * `method` designates the type of authentication to be performed.
   * `unauthenticated` performs no further steps and will not associate the connection with any user.
   * `anonymous` will create a new account with no external authentication provider.
@@ -23,7 +23,7 @@ For now let's just leave this a placeholder, since we haven't gotten to authenti
 #### Handshake Response
 ```
 {
-  "request_id": <NUMBER>,
+  "requestId": <NUMBER>,
   "token": <STRING>
 }
 ```
@@ -33,90 +33,37 @@ For now let's just leave this a placeholder, since we haven't gotten to authenti
 #### Handshake Error Response
 ```
 {
-  "request_id": <NUMBER>,
+  "requestId": <NUMBER>,
   "error": <STRING>,
-  "error_code": <NUMBER>
+  "errorCode": <NUMBER>
 }
 ```
 
-### Requests
+### Client to Server Messages
 
+#### Requests
 All requests match the following pattern:
 ```
 {
-  "request_id": <NUMBER>,
-  "type": <STRING>,
-  "options": <OBJECT>
-}
-```
-* `request_id` is a number uniquely identifying this request, it will be returned in any responses
-* `type` is the endpoint for the query - one of `query`, `subscribe`, `store_error`, `store_replace`, `update`, or `remove`.
-* `options` is an object structured differently for each endpoint.
-
-
-#### query, subscribe
-
-```
-{
-  "request_id": <NUMBER>,
-  "type": "query" | "subscribe",
+  "requestId": <NUMBER>,
   "options": {
-    "collection": <STRING>,
-    "order": [ <ARRAY>, "ascending" | "descending"],
-    "above": [ <OBJECT>, "open" | "closed" ],
-    "below": [ <OBJECT>, "open" | "closed" ],
-    "find": <OBJECT>,
-    "find_all": [<OBJECT>, ...],
-    "limit": <NUMBER>,
+    <METHOD>: [ <ARGUMENT>, ... ],
   }
 }
 ```
-* `collection` describes which table to operate on in the horizon database.
-* `order` orders the results according to an array of fields - optional.
-  * The first argument is an array of field names, most-significant first.
-  * The second argument determines which direction the results are sorted in.
-* `above` and `below` are arrays describing the boundaries regarding `order` - optional.
-  * `above` and `below` can only be specified if `order` is provided.
-  * The first argument is an object whose key-value pairs correspond to fields in `order`.
-  * The second argument should be `closed` to include the boundary, and `open` otherwise.
-* `find` returns one object in `collection` that exactly matches the fields in the object given - optional.
-  * `find` cannot be used with `find_all`, `order`, `above`, or `below`.
-* `find_all` is an array of objects whose key-value pairs correspond to keys in `index` - optional.
-  * Returns any object in `collection` that exactly matches the fields in any of the objects given.
-  * `find_all` cannot be used with `find`.
-  * `find_all` with multiple objects cannot be used with `order`, `above`, or `below`.
-* `limit` limits the number of results to be selected - optional.
+* `requestId` is a number uniquely identifying this request, it will be returned in any responses
+* `options` is an object containing arguments to be passed to various handlers.  Each key is the name of the method, and the value is an array of arguments specified.
 
-#### insert, store, upsert, replace, update, remove
 
+#### Stop Request
+Tells the horizon server to close a request early and to stop sending
+any more changes for the given `requestId`.  Data may still be
+received until the server has processed this and sent a 
+`"state": "complete"` response for the subscription.
 ```
 {
-  "request_id": <NUMBER>,
-  "type": "store" | "update" | "upsert" | "insert" | "replace" | "remove",
-  "options": {
-    "collection": <STRING>,
-    "data": [<OBJECT>, ... ]
-  }
-}
-```
-* `collection` describes which table to operate on in the horizon database
-* `data` is the documents to be written (or removed)
-  * `data[i].id` is required for `remove` operations, all other fields are optional
-  * `data[i].id` may be omitted in an `insert`, `store`, or `upsert` operations: a new row will be inserted in the collection
-* `type` is the write operation to perform
-  * `insert` inserts new documents, erroring if any document already exists
-  * `update` updates existing documents. It errors if any document does not already exist
-  * `upsert` updates existing documents or inserts them if they do not exist
-  * `replace` replaces existing documents entirely. It errors if any document does not already exist
-  * `store` replaces existing documents entirely, or inserts them if they don't exist.
-  * `remove` removes documents. It will not error if a document does not exist
-
-#### end_subscription
-Tells the horizon server to stop sending data for a given subscription.  Data may still be received until the server has processed this and sent a `"state": "complete"` response for the subscription.
-```
-{
-  "request_id": <NUMBER>,
-  "type": "end_subscription"
+  "requestId": <NUMBER>,
+  "type": "stop"
 }
 ```
 
@@ -124,58 +71,66 @@ Tells the horizon server to stop sending data for a given subscription.  Data ma
 This is used by the client to perform an empty request to avoid connection interruption.
 ```
 {
-  "request_id": <NUMBER>,
+  "requestId": <NUMBER>,
   "type": "keepalive"
 }
 ```
 
-### Responses
+### Server to Client Messages
 
-#### Error Response
-This can be sent for any request at any time.  Once an error response is sent, no further responses shall be sent for the corresponding `request_id`.
+#### Request Responses
+
+##### Success
+The client maintains an object for each request, which can be modified
+by JSON patches sent from the server.  Each message may contain a set
+of patches until `"state": "complete"` is specified, at which point no
+further messages should be sent.
 ```
 {
-  "request_id": <NUMBER>,
-  "error": <STRING>,
-  "error_code": <INTEGER>
-}
-```
-* `request_id` is the same as the `request_id` in the corresponding request
-* `error` is a descriptive error string
-* `error_code` is a code that can be used to identify the type of error, values TBD
-
-#### query, subscribe
-`query` and `subscribe` requests will result in a stream of results from the horizon server to the client.  The stream will be an ordered set of messages from the server following the structure below.  If an error occurs, the above Error Response structure will be used, and the stream is considered "complete".  An Error Response may still be sent even after a successful data response, but not after `"state": "complete"`.
-```
-{
-  "request_id": <NUMBER>,
-  "data": <ARRAY>,
-  "state": "synced" | "complete"
-}
-```
-* `request_id` is the same as the `request_id` in the corresponding request
-* `data` is an array of results for the `query` or `subscribe`, and may be empty
-* `state` is optional, and indicates a change in the stream of data:
-  * `synced` means that following the consumption of `data`, the client has all the initial results of a `subscribe`
-  * `complete` means that following the consumption of `data`, no more results will be returned for the request
-
-#### Write responses
-`store`, `replace`, `insert`, `update`, `upsert`, and `remove` requests will be given a single response.  This may be an Error Response, or:
-```
-{
-  "request_id": <NUMBER>,
-  "data": [ { "id": <DOCUMENT_ID>, "$hz_v$": <DOCUMENT_VERSION> } | { "error": <STRING>, "error_code": <INTEGER> }, ...],
+  "requestId": <NUMBER>,
+  "patches": [ <PATCH>, ... ],
   "state": "complete"
 }
 ```
-* `data` is an array of objects corresponding to the documents specified in the write (whether or not a change occurred). For inserted documents it will be the id generated by the server as well as the latest version field for the affected document.  If an error occurred, there will instead be an error description string and an error code in the object .  The items in the array correspond directly to the changes in the request, in the same order.
-* `state` can only be "complete" for write responses
 
-#### Keepalive
+The object maintained in the client contains a few fields to influence
+how it is presented to the user in its observable.  Its format is:
+```
+{
+  "type": "value" | "set",
+  "val": <ANY>,
+  "synced": true | false
+}
+```
+
+The value will not be published to the observable unless `synced` is
+true.  This allows the multiple (non-atomic) patches to be applied 
+without the user being shown inconsistent data.  The `type` field
+indicates what should be passed as the value of the observable:
+ * "value": the `val` field is the literal value to pass on to the
+     observable
+ * "set" : the `val` field is an object whose keys are used internally
+     for patching, but should be presented to the observable as an
+     array (deterministically ordered?).
+
+##### Error
+This can be sent for any request at any time.  Once an error response is sent, no further responses shall be sent for the corresponding `requestId`.
+```
+{
+  "requestId": <NUMBER>,
+  "error": <STRING>,
+  "errorCode": <INTEGER>
+}
+```
+* `requestId` is the same as the `requestId` in the corresponding request
+* `error` is a descriptive error string
+* `errorCode` is a code that can be used to identify the type of error, values TBD
+
+#### Keepalive Response
 `keepalive` requests will be given a single response.  This will never be an error response unless there is a protocol error.
 ```
 {
-  "request_id": <NUMBER>,
+  "requestId": <NUMBER>,
   "state": "complete"
 }
 ```

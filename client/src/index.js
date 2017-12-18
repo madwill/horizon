@@ -5,7 +5,7 @@ import 'rxjs/add/operator/concatMap'
 import 'rxjs/add/operator/map'
 import 'rxjs/add/operator/filter'
 
-import { Collection, UserDataTerm } from './ast'
+import { TermBase, addOption } from './ast'
 import { HorizonSocket } from './socket'
 import { authEndpoint, TokenStorage, clearAuthTokens } from './auth'
 import { aggregate, model } from './model'
@@ -33,53 +33,51 @@ function Horizon({
   const url = `ws${secure ? 's' : ''}:\/\/${host}\/${path}`
   const socket = new HorizonSocket({
     url,
-    handshakeMaker: tokenStorage.handshake.bind(tokenStorage),
+    tokenStorage,
     keepalive,
     WebSocketCtor,
   })
 
-  // Store whatever token we get back from the server when we get a
-  // handshake response
-  socket.handshake.subscribe({
-    next(handshake) {
-      if (authType !== 'unauthenticated') {
-        tokenStorage.set(handshake.token)
-      }
-    },
-    error(err) {
-      if (/JsonWebTokenError|TokenExpiredError/.test(err.message)) {
-        console.error('Horizon: clearing token storage since auth failed')
-        tokenStorage.remove()
-      }
-    },
-  })
+  const request = new TermBase({}, sendRequest)
 
   // This is the object returned by the Horizon function. It's a
   // function so we can construct a collection simply by calling it
   // like horizon('my_collection')
   function horizon(name) {
-    return new Collection(sendRequest, name, lazyWrites)
+    return request.collection(name);
   }
 
-  horizon.currentUser = () =>
-    new UserDataTerm(horizon, socket.handshake, socket)
-
-  horizon.disconnect = () => {
-    socket.complete()
+  // Convenience function to access the current user's row
+  // TODO: this is a terrible, terrible hack
+  horizon.currentUser = () => {
+    function makeRequest(type) {
+      // User ID won't be available until we've connected
+      const userId = { toJSON: () => socket.handshake.value.id };
+      return socket.handshake.last().map((handshake) => {
+        if (handshake.id === null) {
+          throw new Error('Unauthenticated users have no user document.');
+        }
+      }).ignoreElements().concat(request.collection('users').find({id: userId})[type]());
+    }
+    return {
+      fetch: () => makeRequest('fetch'),
+      watch: () => makeRequest('watch'),
+    };
   }
 
-  // Dummy subscription to force it to connect to the
-  // server. Optionally provide an error handling function if the
-  // socket experiences an error.
+  horizon.request = request;
+
+  // Force the socket to connect without any pending requests
+  // Optionally provide an error handling function if the socket experiences an error.
   // Note: Users of the Observable interface shouldn't need this
-  horizon.connect = (
-    onError = err => { console.error(`Received an error: ${err}`) }
-  ) => {
-    socket.subscribe(
-      () => {},
-      onError
-    )
-  }
+  horizon.connect = (onError = (err) => console.error(`Horizon socket error: ${err}`)) =>
+    socket.connect(onError)
+
+  // Note: this only works as long as there are no extra observers on the socket
+  horizon.disconnect = () => socket.disconnect()
+
+  // RSI: remove this - for debugging purposes
+  horizon.socket = socket;
 
   // Either subscribe to status updates, or return an observable with
   // the current status and all subsequent status changes.
@@ -100,7 +98,7 @@ function Horizon({
   horizon.utensils = {
     sendRequest,
     tokenStorage,
-    handshake: socket.handshake,
+    handshake: () => socket.handshake,
   }
   Object.freeze(horizon.utensils)
 
@@ -108,20 +106,14 @@ function Horizon({
   horizon._root = `http${(secure) ? 's' : ''}://${host}`
   horizon._horizonPath = `${horizon._root}/${path}`
   horizon.authEndpoint = authEndpoint
-  horizon.hasAuthToken = tokenStorage.hasAuthToken.bind(tokenStorage)
+  horizon.hasAuthToken = () => tokenStorage.hasAuthToken()
   horizon.aggregate = aggregate
   horizon.model = model
 
   return horizon
 
-  // Sends a horizon protocol request to the server, and pulls the data
-  // portion of the response out.
-  function sendRequest(type, options) {
-    // Both remove and removeAll use the type 'remove' in the protocol
-    const normalizedType = type === 'removeAll' ? 'remove' : type
-    return socket
-      .hzRequest({ type: normalizedType, options }) // send the raw request
-      .takeWhile(resp => resp.state !== 'complete')
+  function sendRequest(options) {
+    return socket.hzRequest(options)
   }
 }
 
@@ -137,5 +129,6 @@ function subscribeOrObservable(observable) {
 
 Horizon.Socket = HorizonSocket
 Horizon.clearAuthTokens = clearAuthTokens
+Horizon.addOption = addOption
 
 module.exports = Horizon

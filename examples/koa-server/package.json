@@ -9,7 +9,8 @@
   "author": "RethinkDB",
   "license": "MIT",
   "dependencies": {
-    "horizon-server": "file:../../server",
+    "@horizon/koa-router": "1.x",
+    "@horizon-plugins/defaults": "1.x",
     "koa": "^1.1.2"
   },
   "repository": {

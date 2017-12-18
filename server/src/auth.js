@@ -1,132 +1,137 @@
 'use strict';
 
-const logger = require('./logger');
-const options_schema = require('./schema/server_options').auth;
-const writes = require('./endpoint/writes');
+const {auth: authSchema} = require('./schema');
 
 const Joi = require('joi');
-const Promise = require('bluebird');
-const jwt = Promise.promisifyAll(require('jsonwebtoken'));
-const r = require('rethinkdb');
+const jwt = require('jsonwebtoken');
 const url = require('url');
 
-
-class JWT {
-  constructor(options) {
-    this.duration = options.duration;
-    this.algorithm = 'HS512';
-
-    if (options.token_secret != null) {
-      this.secret = new Buffer(options.token_secret, 'base64');
-    } else {
-      throw new Error(
-        'No token_secret set! Try setting it in .hz/secrets.toml ' +
-        'or passing it to the Server constructor.');
-    }
+// Rather than create a class, capture the tokenSecret so it can't be
+// inspected by plugins.
+function tokens(options) {
+  if (!options.tokenSecret) {
+    throw new Error(
+      'No tokenSecret set! Try setting it in .hz/secrets.toml ' +
+      'or passing it to the Server constructor.');
   }
 
-  // A generated token contains the data:
-  // { id: <uuid>, provider: <string> }
-  sign(payload) {
-    const token = jwt.sign(
+  const secret = new Buffer(options.tokenSecret, 'base64');
+  const expiresIn = options.duration;
+  const algorithm = 'HS512';
+
+  return {
+    sign: (payload) => ({
+      token: jwt.sign(payload, secret, {algorithm, expiresIn}),
       payload,
-      this.secret,
-      { algorithm: this.algorithm, expiresIn: this.duration }
-    );
-
-    return { token, payload };
-  }
-
-  verify(token) {
-    return jwt.verifyAsync(token, this.secret, { algorithms: [ this.algorithm ] })
-    .then((payload) => ({ token, payload }));
-  }
+    }),
+    verify: (token) => ({
+      token,
+      payload: jwt.verify(token, secret, {algorithms: [algorithm]}),
+    }),
+  };
 }
 
-
 class Auth {
-  constructor(server, user_options) {
-    const options = Joi.attempt(user_options, options_schema);
+  constructor(context) {
+    // RSI: don't expose tokenSecret to plugins
+    this.context = context;
+    this.options = Joi.attempt(this.context.horizon.options.auth, authSchema);
+    this.tokens = tokens(this.options);
+    this.successUrl = url.parse(this.options.successRedirect);
+    this.failureUrl = url.parse(this.options.failureRedirect);
 
-    this._jwt = new JWT(options);
+    const r = this.context.horizon.r;
+    const projectName = this.context.horizon.options.projectName;
+    this.usersTable = r.db(projectName).table('users');
+    this.usersAuthTable = r.db(projectName).table('hz_users_auth');
 
-    this._success_redirect = url.parse(options.success_redirect);
-    this._failure_redirect = url.parse(options.failure_redirect);
-    this._create_new_users = options.create_new_users;
-    this._new_user_group = options.new_user_group;
-    this._allow_anonymous = options.allow_anonymous;
-    this._allow_unauthenticated = options.allow_unauthenticated;
-
-    this._parent = server;
+    if (this.options.allowAnonymous && !this.options.createNewUsers) {
+      throw new Error('Cannot allow anonymous users without new user creation.');
+    }
   }
 
   handshake(request) {
-    switch (request.method) {
-    case 'token':
-      return this._jwt.verify(request.token);
-    case 'unauthenticated':
-      if (!this._allow_unauthenticated) {
-        throw new Error('Unauthenticated connections are not allowed.');
+    const r = this.context.horizon.r;
+    return Promise.resolve().then(() => {
+      switch (request.options.method) {
+      case 'token':
+        return this.tokens.verify(request.options.token);
+      case 'unauthenticated':
+        if (!this.options.allowUnauthenticated) {
+          throw new Error('Unauthenticated connections are not allowed.');
+        }
+        return this.tokens.verify(this.tokens.sign({id: null, provider: request.options.method}).token);
+      case 'anonymous':
+        if (!this.options.allowAnonymous) {
+          throw new Error('Anonymous connections are not allowed.');
+        }
+        return this.generate(request.options.method, r.uuid());
+      default:
+        throw new Error(`Unknown handshake method "${request.options.method}"`);
       }
-      return this._jwt.verify(this._jwt.sign({ id: null, provider: request.method }).token);
-    case 'anonymous':
-      if (!this._allow_anonymous) {
-        throw new Error('Anonymous connections are not allowed.');
-      }
-      return this.generate(request.method, r.uuid());
-    default:
-      throw new Error(`Unknown handshake method "${request.method}"`);
-    }
-  }
-
-  // Can't use objects in primary keys, so convert those to JSON in the db (deterministically)
-  auth_key(provider, info) {
-    if (info === null || Array.isArray(info) || typeof info !== 'object') {
-      return [ provider, info ];
-    } else {
-      return [ provider, r.expr(info).toJSON() ];
-    }
-  }
-
-  new_user_row(id) {
-    return {
-      id,
-      groups: [ 'default', this._new_user_group ],
-      [writes.version_field]: 0,
-    };
+    });
   }
 
   // TODO: maybe we should write something into the user data to track open sessions/tokens
-  generate(provider, info) {
+  // Gets or creates an account linked with an auth provider account
+  generate(provider, providerId, data) {
+    const r = this.context.horizon.r;
     return Promise.resolve().then(() => {
-      const key = this.auth_key(provider, info);
-      const db = r.db(this._parent._name);
+      const key = this._authKey(provider, providerId);
 
-      const insert = (table, row) =>
-        db.table(table)
-          .insert(row, { conflict: 'error', returnChanges: 'always' })
-          .bracket('changes')(0)('new_val');
+      let query = this.usersTable.get(this.usersAuthTable.get(key)('user_id'));
 
-      let query = db.table('users')
-                    .get(db.table('hz_users_auth').get(key)('user_id'))
-                    .default(r.error('User not found and new user creation is disabled.'));
-
-      if (this._create_new_users) {
-        query = insert('hz_users_auth', { id: key, user_id: r.uuid() })
-          .do((auth_user) => insert('users', this.new_user_row(auth_user('user_id'))));
+      if (this.options.createNewUsers) {
+        query = query.default(() =>
+          r.uuid().do((id) =>
+            // eslint-disable-next-line camelcase
+            this.usersAuthTable.insert({id: key, user_id: id, data})
+              .do((res) =>
+                r.branch(res('errors').ne(0), r.error(res('first_error')),
+                  this.usersTable.insert(this._newUserRow(id, data || {}))))
+              .do(() => id)
+          )
+        );
+      } else {
+        query = query.default(
+          r.error('User not found and new user creation is disabled.'));
       }
 
-      return query.run(this._parent._reql_conn.connection()).catch((err) => {
-        // TODO: if we got a `Duplicate primary key` error, it was likely a race condition
-        // and we should succeed if we try again.
-        logger.debug(`Failed user lookup or creation: ${err}`);
-        throw new Error('User lookup or creation in database failed.');
-      });
-    }).then((user) =>
-      this._jwt.sign({ id: user.id, provider })
-    );
+      return query.run(this.context.horizon.conn());
+    }).then((userId) =>
+      this.tokens.sign({id: userId, provider})
+    ).catch((err) => {
+      // TODO: if we got a `Duplicate primary key` error, it was likely a race condition
+      // and we should succeed if we try again.
+      this.context.horizon.events.emit('log', 'debug',
+        `Failed user lookup or creation: ${err}`);
+      throw new Error('User lookup or creation in database failed.');
+    });
+  }
+
+  // TODO: add a function to connect an auth provider account with an existing account
+  // connect(provider, providerId, data, userId)
+
+  // Can't use objects in primary keys, so convert those to JSON in the db (deterministically)
+  _authKey(provider, providerId) {
+    if (providerId === null ||
+        Array.isArray(providerId) ||
+        typeof providerId !== 'object') {
+      return [provider, providerId];
+    } else {
+      const r = this.context.horizon.r;
+      return [provider, r.expr(providerId).toJSON()];
+    }
+  }
+
+  _newUserRow(id, data) {
+    return {
+      id,
+      data,
+      groups: ['default', this.options.newUserGroup],
+    };
   }
 }
 
 
-module.exports = { Auth };
+module.exports = Auth;
